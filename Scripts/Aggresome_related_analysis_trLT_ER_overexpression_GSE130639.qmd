@@ -1,0 +1,2116 @@
+---
+title: "Analysis of aggresome-related pathways after viral antigen overexpression"
+author: "Libuše Janská"
+date: last-modified
+date-format: "DD/MM/YYYY"
+institute: "Department of Oncology-Pathology, Karolinska Institutet, Sweden"
+github-repo: "https://github.com/libjan/aggresome_mcc"
+format:
+  html:
+    toc: true
+    toc-location: left-body
+    toc-depth: 3
+    toc-expand: 3
+    code-fold: true
+    code-summary: "Show code"
+    number-sections: true
+    smooth-scroll: true
+---
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+#library(renv)
+#renv::load()
+
+library(tidyverse)
+library(here)
+
+set.seed(123)
+```
+
+# Aim and data source
+
+The aim of this script is to analyze bulk RNA-seq data from human embryonic fibroblasts with **Merkel cell polyomavirus** (MCPyV) **truncated large tumor antigen (TLT)**, **early region (ER)**, and **GFP control** inducible vectors. We will look for genes and pathways associated with proteostasis, particularly with interest in aggresome, unfolded protein response, and autophagy using annotated gene sets. The data was downloaded from the GEO database, series [GSE130639](http://ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE130639). The data is described in more detail in Yang et al., 2025 [(doi: 10.1172/JCI177724)](https://doi.org/10.1172/jci177724).
+
+We will focus on samples at 24 and 48 hours after induction of TLT, ER, or the control vectors. 
+
+# Summary of main findings
+
+In the following analysis we show these main findings:
+
+- UPR response, as defined by Hallmark gene sets, is upregulated in ER vs. GFP (@fig-ERHbar) and downregulated in TLT vs. GFP (@fig-TLTHbar), however the running enrichment score shows these enrichments to be bidirectional, with gene hits at both extremes (@fig-ERHUPR, @fig-TLTHUPR).
+
+- Enriched proteostasis-related GO terms showed upregulation of chaperones and their binding, but a decrease in autophagy (@fig-ERGOprotbar, @fig-TLTGOprotbar). Similar patterns were observed for proteostasis-related Reactome terms (@fig-ERRprotbar, @fig-TLTRprotbar).
+
+- Top-ranked genes in the select proteostasis-related pathways mostly shared expression patterns across ER and TLT replicates (@fig-TOPgeneHeatmap). The shown pathways were selected to be minimally overlapping (@fig-ERemap, @fig-TLTemap) to broadly cover most of the enriched terms in both comparisons.
+
+- Aggresome-specific signature was positively associated to TLT or ER expression, but not significant (@fig-ERagg, @fig-TLTagg).
+
+- Although not all samples at 48hrs post induction were available, the available samples show the same trends in proteostasis pathways as the 24hr-timepoint highlighted in the results above.
+
+
+# Data loading
+
+Raw counts were downloaded from GEO. Information on sample identity and gene IDs provided from the accession were also used.
+
+```{r}
+# load in counts
+counts_full <- read.csv(
+  here("Data", "GSE130639_raw_counts_GRCh38.p13_NCBI.csv"),
+  sep = ";"
+)
+# load sample identifiers
+sample_ids <- read.csv(here("Data", "GSE130639_series_matrix.csv"), sep = ";")[,
+  1:2
+]
+# load gene names and symbols
+gene_symbols <- read.csv(
+  here("Data", "Human.GRCh38.p13.annot_mod.csv"),
+  sep = ";"
+)
+```
+
+Convert gene names to symbols and column names to more descriptive sample names. Summarize any duplicate gene symbol names. These duplicates are handled by summation of counts.
+```{r}
+library(dplyr)
+
+#Two gene names are duplicated
+gene_symbols[which(duplicated(gene_symbols$Symbol)), ]
+
+new_names <- setNames(sample_ids$sample_id, sample_ids$sample_type)
+
+counts <- counts_full %>%
+  #convert gene names to symbols
+  left_join(gene_symbols, by = "GeneID") %>%
+  select(Symbol, everything(), -GeneID) %>%
+  #change column names to more descriptive sample names
+  dplyr::rename(any_of(new_names)) %>%
+  #get rid of duplicates by summing them
+  group_by(Symbol) %>%
+  summarise(across(where(is.numeric), sum), .groups = "drop") %>%
+  column_to_rownames("Symbol")
+
+#write.csv(counts, here("Outputs", "GSE130639_rawcounts_formatted_20260911.csv"))
+```
+Next, the samples of interest will be extracted and analyzed.
+
+
+# 24hr timepoint
+
+Next I am only selecting the 24hr timepoint, as 48hr samples are incomplete. These are the available samples:
+```{r}
+count_24 <- counts %>%
+  dplyr::select(matches("^(ER|TLT|GFP)_(24)_"))
+#display included samples
+count_24 %>% colnames
+```
+
+## DESeq2 for normalization and DEG
+
+Next, DESeq2 is used for data normalization and differential gene expression analysis.
+
+Conditions are defined.
+
+```{r}
+#| message: false
+library("DESeq2")
+
+metadata <- data.frame(condition = factor(gsub("_24_(1|2|3)", "", colnames(count_24))), 
+                      replicate = factor(gsub("[A-Za]+_24_", "", colnames(count_24)))) 
+rownames(metadata) <- colnames(count_24)
+
+dds <- DESeqDataSetFromMatrix(countData = as.matrix(count_24),
+                              colData = metadata,
+                              design = ~ condition)
+```
+
+Low-expressed genes are filtered and the model is fitted.
+```{r}
+#| message: false
+# Remove genes have less than 3 samples with 10 counts or more
+keep <- rowSums(counts(dds) >= 10) >= 3
+dds <- dds[keep,]
+
+#Deseq function automatically estimates size factors and dispersions
+dds <- DESeq(dds)
+```
+
+Additionally, data is normalized and transformed for eventual heatmap plotting.
+```{r}
+#transform counts using vst
+vsd <- vst(dds)
+transformed_counts <- assay(vsd)
+```
+
+## DEGs
+
+Look at top ten genes in the two main comparisons of interest (ER vs. GFP and TLT vs. GFP).
+
+ER results:
+```{r}
+res_ER <- results(dds, alpha = 0.05, contrast = c("condition","ER", "GFP"))
+summary(res_ER)
+
+#top10 genes
+res_ER[order(res_ER$pvalue),] %>% head(10)
+```
+
+Interactive table for **ER vs. GFP (padj < 0.05, abs(log2FoldChange) > 1)**:
+```{r}
+library(DT)
+
+res_ER_dt <- res_ER %>% as.data.frame %>% filter(padj < 0.05, abs(log2FoldChange) > 1) %>% select(baseMean, log2FoldChange, pvalue, padj) %>% mutate(baseMean = round(baseMean, 3), log2FoldChange = round(log2FoldChange,3), pvalue = round(pvalue,5), padj = round(padj,5)) %>% tibble::rownames_to_column("gene")
+
+datatable(
+  res_ER_dt,
+  filter = "top",
+  options = list(
+    pageLength = 10, 
+    scrollX = TRUE
+  ),
+  rownames = TRUE
+)
+```
+
+TLT results:
+```{r}
+res_TLT <- results(dds, alpha = 0.05, contrast = c("condition","TLT", "GFP"))
+summary(res_TLT)
+
+res_TLT[order(res_TLT$pvalue),] %>% head(10)
+```
+
+Interactive table for **TLT vs. GFP (padj < 0.05, abs(log2FoldChange) > 1)**:
+```{r}
+res_TLT_dt <- res_TLT %>% as.data.frame %>% filter(padj < 0.05, abs(log2FoldChange) > 1) %>% select(baseMean, log2FoldChange, pvalue, padj) %>% mutate(baseMean = round(baseMean, 3), log2FoldChange = round(log2FoldChange,3), pvalue = round(pvalue,5), padj = round(padj,5)) %>% tibble::rownames_to_column("gene")
+
+datatable(
+  res_TLT_dt,
+  filter = "top",
+  options = list(
+    pageLength = 10, 
+    scrollX = TRUE
+  ),
+  rownames = TRUE
+)
+```
+
+In both comparisons, there are more downregulated genes (e.g. higher in control). 
+
+## Over-representation analysis
+
+First extract all significantly differentially expressed genes. (padj < 0.05, abs(log2FoldChange) > 1) Also extract the universes for both comparisons.
+```{r}
+#| message: false
+
+library(clusterProfiler)
+library(enrichplot)
+library(msigdbr)
+
+# convert results to tibble
+deg_ER <- res_ER %>% 
+  as_tibble(rownames = "gene")
+
+#extract up and down-regulated genes
+up_ER <- deg_ER %>%
+  filter(padj < 0.05, log2FoldChange > 1) %>% 
+  pull(gene)
+
+down_ER <- deg_ER %>%
+  filter(padj < 0.05, log2FoldChange < -1) %>% 
+  pull(gene)
+
+#extract all genes in the universe
+universe_ER <- deg_ER %>% pull(gene)
+
+#same for TLT cmparison
+deg_TLT <- res_TLT %>% 
+  as_tibble(rownames = "gene")
+
+up_TLT <- deg_TLT %>%
+  filter(padj < 0.05, log2FoldChange > 1) %>% 
+  pull(gene)
+
+down_TLT <- deg_TLT %>%
+  filter(padj < 0.05, log2FoldChange < -1) %>% 
+  pull(gene)
+
+universe_TLT <- deg_TLT %>% pull(gene)
+```
+
+### Hallmark gene sets
+
+First will look at Hallmark gene sets, particularly interested in unfolded protein response.
+
+Hallmark gene sets in ER vs. GFP:
+
+::: {.panel-tabset}
+
+#### Up in ER
+```{r}
+msig_h <- msigdbr(species = "Homo sapiens", collection = "H")
+ORA_H_up_ER <- enricher(
+  gene = up_ER,            # can use SYMBOL here
+  TERM2GENE = msig_h[, c("gs_name", "gene_symbol")],
+  universe = universe_ER,
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+enrichplot::dotplot(ORA_H_up_ER, showCategory = 10, title = "Upregulated genes in ER")
+```
+
+#### Down in ER
+```{r}
+ORA_H_down_ER <- enricher(
+  gene = down_ER,            # can use SYMBOL here
+  TERM2GENE = msig_h[, c("gs_name", "gene_symbol")],
+  universe = universe_ER,
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+enrichplot::dotplot(ORA_H_down_ER, showCategory = 10, title = "Downregulated genes in ER")
+```
+:::
+
+Hallmark gene set ORA in TLT:
+
+::: {.panel-tabset}
+
+#### Up in TLT
+
+```{r}
+ORA_H_up_TLT <- enricher(
+  gene = up_TLT,            # can use SYMBOL here
+  TERM2GENE = msig_h[, c("gs_name", "gene_symbol")],
+  universe = universe_TLT,
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+enrichplot::dotplot(ORA_H_up_TLT, showCategory = 10, title = "Upregulated genes in TLT")
+```
+
+#### Down in TLT
+```{r}
+ORA_H_down_TLT <- enricher(
+  gene = down_TLT,            # can use SYMBOL here
+  TERM2GENE = msig_h[, c("gs_name", "gene_symbol")],
+  universe = universe_TLT,
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+enrichplot::dotplot(ORA_H_down_TLT, showCategory = 10, title = "Downregulated genes in TLT")
+```
+:::
+There was no enrichment of unfolded protein response.
+
+### Reactome gene sets
+
+Particularly interested in terms that have to do with unfolded response, autophagy, chaperones, heat shock, proteosome, aggresome, etc.
+
+Comparison for ER:
+
+::: {.panel-tabset}
+
+#### Up in ER
+
+```{r}
+#| fig-height: 8
+#| warning: false
+msig_react <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:REACTOME")
+
+ORA_R_up_ER <- enricher(
+  gene = up_ER,            # can use SYMBOL here
+  TERM2GENE = msig_react[, c("gs_name", "gene_symbol")],
+  universe = universe_ER,
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+enrichplot::dotplot(ORA_R_up_ER, showCategory = 20, title = "Upregulated genes in ER (top 20 reactome)")
+```
+
+Which of all enriched reactome terms are connected to the pathways of interest?
+```{r}
+# are any enriched terms involved in unfolded protein response
+as.data.frame(ORA_R_up_ER) %>%
+  filter(grepl("UNFOLD|AUTOPHAG|PROTEO|HEAT.?SHOCK|HSP|ER.?STRESS|UPR|CHAPER|AGGRE|MISFOLD", Description)) %>%
+  select(Description, GeneRatio, pvalue, p.adjust)
+```
+
+Found one term that has to do with HSF1-mediated heat shock in genes upregulated in ER. DEGs involved in this pathway are the following:
+
+```{r}
+cnetplot(ORA_R_up_ER, showCategory = "REACTOME_REGULATION_OF_HSF1_MEDIATED_HEAT_SHOCK_RESPONSE")
+```
+
+Now for downregulated genes.
+
+#### Down in ER
+
+```{r}
+#| fig-height: 8
+ORA_R_down_ER <- enricher(
+  gene = down_ER,            # can use SYMBOL here
+  TERM2GENE = msig_react[, c("gs_name", "gene_symbol")],
+  universe = universe_ER,
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+enrichplot::dotplot(ORA_R_down_ER, showCategory = 20, title = "Downregulated genes in ER (top 20 reactome)")
+```
+
+Are any of the enriched terms in relevant pathways?
+```{r}
+# are any enriched terms involved in unfolded protein response
+as.data.frame(ORA_R_down_ER) %>%
+  filter(grepl("UNFOLD|AUTOPHAG|PROTEO|HEAT.?SHOCK|HSP|ER.?STRESS|UPR|CHAPER|AGGRE|MISFOLD", Description)) %>%
+  select(Description, GeneRatio, pvalue, p.adjust)
+```
+
+No relevant terms in downregulated in ER.
+
+:::
+
+Next ORA in TLT DEGs:
+
+::: {.panel-tabset}
+
+#### Up in TLT
+```{r}
+#| fig-height: 7.8
+ORA_R_up_TLT <- enricher(
+  gene = up_TLT,            # can use SYMBOL here
+  TERM2GENE = msig_react[, c("gs_name", "gene_symbol")],
+  universe = universe_TLT,
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+enrichplot::dotplot(ORA_R_up_TLT, showCategory = 20, title = "Upregulated genes in TLT (top 20 reactome)")
+```
+
+Relevant pathways:
+```{r}
+# are any enriched terms involved in unfolded protein response
+as.data.frame(ORA_R_up_TLT) %>%
+  filter(grepl("UNFOLD|AUTOPHAG|PROTEO|HEAT.?SHOCK|HSP|ER.?STRESS|UPR|CHAPER|AGGRE|MISFOLD", Description)) %>%
+  select(Description, GeneRatio, pvalue, p.adjust)
+```
+
+Same specific reactome pathway found in upregulated in TLT as in ER. These DEGs are involved:
+
+```{r}
+cnetplot(ORA_R_up_TLT, showCategory = "REACTOME_REGULATION_OF_HSF1_MEDIATED_HEAT_SHOCK_RESPONSE")
+```
+
+Next are downregulated genes in TLT.
+
+#### Down in TLT
+```{r}
+#| fig-height: 7.5
+ORA_R_down_TLT <- enricher(
+  gene = down_TLT,            # can use SYMBOL here
+  TERM2GENE = msig_react[, c("gs_name", "gene_symbol")],
+  universe = universe_TLT,
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+enrichplot::dotplot(ORA_R_down_TLT, showCategory = 20, title = "Downregulated genes in TLT (top 20 reactome)")
+```
+
+Relevant pathways:
+```{r}
+# are any enriched terms involved in unfolded protein response
+as.data.frame(ORA_R_down_TLT) %>%
+  filter(grepl("UNFOLD|AUTOPHAG|PROTEO|HEAT.?SHOCK|HSP|ER.?STRESS|UPR|CHAPER|AGGRE|MISFOLD", Description)) %>%
+  select(Description, GeneRatio, pvalue, p.adjust)
+```
+
+No relevant enriched terms in downregulate TLT genes.
+:::
+
+#### Conclusion
+
+From the Reactome searched terms, HSF1-mediated heat shock response is the only one enriched, both in upregulated genes in ER and TLT.
+
+### GO terms
+
+Upregulated in ER:
+
+::: {.panel-tabset}
+
+#### Up in ER
+```{r}
+#| fig-height: 7.5
+msig_GO <- msigdbr(species = "Homo sapiens", category = "C5")
+
+ORA_GO_up_ER <- enricher(
+  gene = up_ER,            # can use SYMBOL here
+  TERM2GENE = msig_GO[, c("gs_name", "gene_symbol")],
+  universe = universe_ER,
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+enrichplot::dotplot(ORA_GO_up_ER, showCategory = 20, title = "Upregulated genes in ER (top 20 GO)")
+```
+
+Relevant pathways:
+```{r}
+# are any enriched terms involved in unfolded protein response
+as.data.frame(ORA_GO_up_ER) %>%
+  filter(grepl("UNFOLD|AUTOPHAG|PROTEO|HEAT.?SHOCK|HSP|ER.?STRESS|UPR|CHAPER|AGGRE|MISFOLD", Description)) %>%
+  select(Description, GeneRatio, pvalue, p.adjust)
+```
+
+No relevant terms found.
+
+Downregulated in ER:
+
+#### Down in ER
+```{r}
+#| fig-height: 7.5
+ORA_GO_down_ER <- enricher(
+  gene = down_ER,            # can use SYMBOL here
+  TERM2GENE = msig_GO[, c("gs_name", "gene_symbol")],
+  universe = universe_ER,
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+enrichplot::dotplot(ORA_GO_down_ER, showCategory = 20, title = "Downregulated genes in ER (top 20 GO)")
+```
+
+Relevant terms:
+```{r}
+# are any enriched terms involved in unfolded protein response
+as.data.frame(ORA_GO_down_ER) %>%
+  filter(grepl("UNFOLD|AUTOPHAG|PROTEO|HEAT.?SHOCK|HSP|ER.?STRESS|UPR|CHAPER|AGGRE|MISFOLD", Description)) %>%
+  select(Description, GeneRatio, pvalue, p.adjust)
+```
+
+No relevant terms found in downregulated in ER either.
+:::
+
+
+Next is TLT.
+
+::: {.panel-tabset}
+
+#### Up in TLT
+```{r}
+#| fig-height: 7.5
+ORA_GO_up_TLT <- enricher(
+  gene = up_TLT,            # can use SYMBOL here
+  TERM2GENE = msig_GO[, c("gs_name", "gene_symbol")],
+  universe = universe_TLT,
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+enrichplot::dotplot(ORA_GO_up_TLT, showCategory = 20, title = "Upregulated genes in TLT (top 20 GO)")
+```
+
+Relevant terms:
+```{r}
+# are any enriched terms involved in unfolded protein response
+as.data.frame(ORA_GO_up_TLT) %>%
+  filter(grepl("UNFOLD|AUTOPHAG|PROTEO|HEAT.?SHOCK|HSP|ER.?STRESS|UPR|CHAPER|AGGRE|MISFOLD", Description)) %>%
+  select(Description, GeneRatio, pvalue, p.adjust)
+```
+
+No relevant terms found.
+
+#### Down in TLT
+```{r}
+#| fig-height: 7.5
+ORA_GO_down_TLT <- enricher(
+  gene = down_TLT,            # can use SYMBOL here
+  TERM2GENE = msig_GO[, c("gs_name", "gene_symbol")],
+  universe = universe_TLT,
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+enrichplot::dotplot(ORA_GO_down_TLT, showCategory = 20, title = "Downregulated genes in TLT (top 20 GO)")
+```
+
+Relevant terms:
+```{r}
+# are any enriched terms involved in unfolded protein response
+as.data.frame(ORA_GO_down_TLT) %>%
+  filter(grepl("UNFOLD|AUTOPHAG|PROTEO|HEAT.?SHOCK|HSP|ER.?STRESS|UPR|CHAPER|AGGRE|MISFOLD", Description)) %>%
+  select(Description, GeneRatio, pvalue, p.adjust)
+```
+
+No relevant terms found.
+:::
+
+#### Conclusion
+
+There were no relevant GO terms found in either ER or TLT, down or upregulated, through ORA with L2FC cutoff at 1 (resp. -1).
+
+## GSEA
+
+Next will perform GSEA on similar genesets in the two condition comparisons. Genes will be ranked by DESeq2 test statistic to incorporate information from both Log2FC and significance.
+
+### Hallmark GSEA
+
+First derive ranked list from **ER vs. GFP** and check top and bottom genes.
+```{r}
+ranked_ER <- deg_ER %>% 
+  # extract statistic
+  pull(stat) %>% 
+  # add names 
+  setNames(deg_ER$gene) %>% 
+  # sort in decreasing order
+  sort(decreasing = T)
+
+#show top and bottom genes to verify behavior
+head(ranked_ER)
+tail(ranked_ER)
+```
+
+Next evaluate Hallmark gene set enrichment.
+
+```{r}
+#| fig-height: 7.8
+#| warning: false
+gsea_H_ER <- GSEA(
+  ranked_ER,
+  TERM2GENE = msig_h[, c("gs_name", "gene_symbol")],
+  verbose = FALSE,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  method = "multilevel")
+
+dotplot(gsea_H_ER, showCategory = 20, title = "Hallmark gene sets:\nER vs. GFP" , split=".sign") + facet_grid(.~.sign)
+```
+
+The unfolded protein response is higher in ER samples.
+
+List the results, including the NES and adjusted p-value.
+```{r}
+as.data.frame(gsea_H_ER) %>%
+  dplyr::select(enrichmentScore, NES, pvalue, p.adjust, log2err)
+```
+
+Barplot for cleaner visualization
+```{r}
+#| fig-height: 5.4
+#| fig-width: 5.6
+#| label: fig-ERHbar
+#| fig-cap: Bar plot of NES scores of Hallmark gene sets in ER vs. GFP.
+gsea_H_ER_res <- as.data.frame(gsea_H_ER)
+bar_plot <- tibble(term = str_to_title(gsub("_"," ", gsub("HALLMARK", "", rownames(gsea_H_ER_res)))),
+                  NES = gsea_H_ER_res$NES, 
+                  padj = gsea_H_ER_res$p.adjust)
+
+bar_plot$term <- factor(bar_plot$term, 
+                  levels = bar_plot$term[order(bar_plot$NES, decreasing = F)])
+
+p <- ggplot(bar_plot, aes(x = NES, y = term, fill = padj)) +
+  geom_bar(stat = "identity") +
+  scale_fill_gradient2(low = "#0000E6", 
+        high = "#C5C5C7", 
+        mid = "#7575EB", 
+        midpoint = 0.025) +
+  geom_vline(xintercept = 0, 
+      color = "black", 
+      linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "ER vs. GFP",
+      subtitle = "Hallmark gene set enrichment",
+      x = "Normalized Enrichment Score", 
+      y = "", 
+      fill = "Adjusted p-value:") +
+  theme(plot.title = element_text(size = 12, hjust = 0.5), 
+        plot.subtitle = element_text(size = 12, hjust = 0.5), 
+        axis.text = element_text(size = 10), 
+        legend.title = element_text(hjust = 0.5))
+
+p
+
+#ggsave(here("Figures","LTST_ER_GSEA_hallmark_full_barplot.pdf"), p, width = 5.6, height = 5.4, units = "in")
+```
+
+Export enrichment results as tsv.
+```{r}
+#write.table(as_tibble(gsea_H_ER),here("Outputs", "SuppTable_ERvsGFP_24hr_GSEA_Hallmark.tsv"), sep = "\t")
+```
+
+Detailed enrichment plot of UPR.
+```{r}
+#| fig-width: 5
+#| fig-height: 3.5
+#| label: fig-ERHUPR
+#| fig-cap: GSEA plot of UPR Hallmark gene set in ER vs. GFP.
+p <- gseaplot2(gsea_H_ER,
+  geneSetID = "HALLMARK_UNFOLDED_PROTEIN_RESPONSE", 
+  title = "ER vs. GFP", 
+  pvalue_table = T,
+  rel_heights = c(1.2, 0.2, 0.5))
+p
+#ggsave(here("Figures","LTST_ER_GSEA_hallmark_UPR.pdf"), p, width = 3.7, height = 2.7, units = "in")
+```
+
+Which genes are in the leading edge?
+```{r}
+#| message: false
+cnetplot(gsea_H_ER, showCategory = "HALLMARK_UNFOLDED_PROTEIN_RESPONSE", foldChange = ranked_ER) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+```
+
+Now for **TLT vs. GFP** comparison. First prepare ranked gene list and check top and bottom genes.
+```{r}
+ranked_TLT <- deg_TLT %>% 
+  # extract statistic
+  pull(stat) %>% 
+  # add names 
+  setNames(deg_TLT$gene) %>% 
+  # sort in decreasing order
+  sort(decreasing = T)
+
+#show top and bottom genes to verify behavior
+head(ranked_TLT)
+tail(ranked_TLT)
+```
+
+Next evaluate Hallmark gene set enrichment.
+
+```{r}
+#| fig-height: 8.5
+#| warning: false
+gsea_H_TLT <- GSEA(
+  ranked_TLT,
+  TERM2GENE = msig_h[, c("gs_name", "gene_symbol")],
+  verbose = FALSE,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  method = "multilevel")
+
+dotplot(gsea_H_TLT, showCategory = 20, title = "Hallmark gene sets:\nTLT vs. GFP" , split=".sign") + facet_grid(.~.sign)
+```
+
+The unfolded protein response is higher in GFP samples in contrast to ER vs. GFP comparison.
+
+List the results, including the NES and adjusted p-value.
+```{r}
+as.data.frame(gsea_H_TLT) %>%
+  dplyr::select(enrichmentScore, NES, pvalue, p.adjust, log2err)
+```
+
+Barplot for cleaner visualization:
+```{r}
+#| fig-height: 5.4
+#| fig-width: 5.6
+#| label: fig-TLTHbar
+#| fig-cap: Bar plot of NES scores of Hallmark gene sets in TLT vs. GFP.
+gsea_H_TLT_res <- as.data.frame(gsea_H_TLT)
+bar_plot <- tibble(term = str_to_title(gsub("_"," ", gsub("HALLMARK", "", rownames(gsea_H_TLT_res)))),
+                  NES = gsea_H_TLT_res$NES, 
+                  padj = gsea_H_TLT_res$p.adjust)
+
+bar_plot$term <- factor(bar_plot$term, 
+                  levels = bar_plot$term[order(bar_plot$NES, decreasing = F)])
+
+p <- ggplot(bar_plot, aes(x = NES, y = term, fill = padj)) +
+  geom_bar(stat = "identity") +
+  scale_fill_gradient2(low = "#0000E6", 
+        high = "#C5C5C7", 
+        mid = "#7575EB", 
+        midpoint = 0.025) +
+  geom_vline(xintercept = 0, 
+      color = "black", 
+      linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "TLT vs. GFP",
+      subtitle = "Hallmark gene set enrichment",
+      x = "Normalized Enrichment Score", 
+      y = "", 
+      fill = "Adjusted p-value:") +
+  theme(plot.title = element_text(size = 12, hjust = 0.5), 
+        plot.subtitle = element_text(size = 12, hjust = 0.5), 
+        axis.text = element_text(size = 10), 
+        legend.title = element_text(hjust = 0.5))
+
+p
+
+#ggsave(here("Figures","LTST_TLT_GSEA_hallmark_full_barplot.pdf"), p, width = 5.6, height = 6.5, units = "in")
+```
+
+Export enrichment results as tsv.
+```{r}
+#write.table(as_tibble(gsea_H_TLT),here("Outputs", "SuppTable_TLTvsGFP_24hr_GSEA_Hallmark.tsv"), sep = "\t")
+```
+
+Detailed enrichment plot of UPR.
+```{r}
+#| fig-width: 5
+#| fig-height: 3.5
+#| label: fig-TLTHUPR
+#| fig-cap: GSEA plot of UPR Hallmark gene set in TLT vs. GFP.
+p <- gseaplot2(gsea_H_TLT,
+  geneSetID = "HALLMARK_UNFOLDED_PROTEIN_RESPONSE", 
+  title = "TLT vs. GFP", 
+  pvalue_table = T,
+  rel_heights = c(1.2, 0.2, 0.5))
+p
+#ggsave(here("Figures","LTST_TLT_GSEA_hallmark_UPR.pdf"), p, width = 3.7, height = 2.7, units = "in")
+```
+
+The pattern seems to go in both directions.
+
+Which genes are in the leading edge?
+```{r}
+#| message: false
+cnetplot(gsea_H_TLT, showCategory = "HALLMARK_UNFOLDED_PROTEIN_RESPONSE", foldChange = ranked_TLT) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+```
+
+#### Conclusion
+
+Hallmark unfolded protein response picks up genes from both upregulated and downregulated areas. In ER vs. GFP, it is overall more activated, but in TLT vs. GFP it is more suppressed. However the difference may be only due to a few genes, as the leading edge genes in both comparisons are distinct.
+
+### Reactome gene sets
+
+First GSEA with Reactome gene sets for **ER vs GFP.**
+
+```{r}
+#| fig-height: 12
+#| warning: false
+gsea_R_ER <- GSEA(
+  ranked_ER,
+  TERM2GENE = msig_react[, c("gs_name", "gene_symbol")],
+  verbose = FALSE,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  method = "multilevel")
+
+dotplot(gsea_R_ER, showCategory = 15, title = "Reactome gene sets:\nER vs. GFP" , split=".sign") + facet_grid(.~.sign)
+```
+
+There are some chaperone related pathways in the top upregulated terms.
+
+Export enrichment results as tsv.
+```{r}
+#write.table(as_tibble(gsea_R_ER),here("Outputs", "SuppTable_ERvsGFP_24hr_GSEA_Reactome.tsv"), sep = "\t")
+```
+
+To specifically look for all enriched terms relevant to proteostasis, we will filter out the results based on keywords related to different proteostasis pathways.
+
+```{r}
+gsea_R_ER_res <- as.data.frame(gsea_R_ER) %>%
+  filter(grepl("UNFOLD|AUTOPHAG|PROTEOS|HEAT.?SHOCK|HSP|ER.?STRESS|UPR|CHAPER|AGGRE|MISFOLD", Description)) %>%
+  select( enrichmentScore, NES, pvalue, p.adjust, log2err)
+
+gsea_R_ER_res
+```
+
+The HSF-1 mediated heat shock term comes up again as upregulated, autophagy terms are downregulated.
+
+Getailed GSEA plot for these hits.
+```{r}
+#| fig-width: 8
+gseaplot2(gsea_R_ER,
+  geneSetID = rownames(gsea_R_ER_res), 
+  title = "ER vs. GFP", 
+  pvalue_table = T,
+  rel_heights = c(2, 0.5, 0.5))
+```
+
+Barplot for cleaner visualization.
+```{r}
+#| fig-height: 2.6
+#| fig-width: 10
+#| label: fig-ERRprotbar
+#| fig-cap: Bar plot of NES scores of proteostasis-related Reactome gene sets in ER vs. GFP.
+bar_plot <- tibble(term = str_to_title(gsub("_"," ", gsub("REACTOME", "", rownames(gsea_R_ER_res)))),
+                  NES = gsea_R_ER_res$NES, 
+                  padj = gsea_R_ER_res$p.adjust)
+
+bar_plot$term <- factor(bar_plot$term, 
+                  levels = bar_plot$term[order(bar_plot$NES, decreasing = F)])
+
+p <- ggplot(bar_plot, aes(x = NES, y = term, fill = padj)) +
+  geom_bar(stat = "identity") +
+  scale_fill_gradient2(low = "#0000E6", 
+        high = "#C5C5C7", 
+        mid = "#7575EB", 
+        midpoint = 0.025) +
+  geom_vline(xintercept = 0, 
+      color = "black", 
+      linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "ER vs. GFP",
+      subtitle = "Reactome: relevant enriched terms",
+      x = "Normalized Enrichment Score", 
+      y = "", 
+      fill = "Adjusted p-value:") +
+  theme(plot.title = element_text(size = 12, hjust = 0.5), 
+        plot.subtitle = element_text(size = 12, hjust = 0.5), 
+        axis.text = element_text(size = 10), 
+        legend.title = element_text(hjust = 0.5))
+
+p
+
+#ggsave(here("Figures","LTST_ER_GSEA_reactome_select_barplot.pdf"), p, width = 9, height = 2.6, units = "in")
+```
+
+Which genes are in the leading edges?
+```{r}
+cnetplot(gsea_R_ER, showCategory = rownames(gsea_R_ER_res), foldChange = ranked_ER) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+```
+
+Now Reactome for **TLT vs. GFP** comparison.
+
+```{r}
+#| fig-height: 12
+#| warning: false
+gsea_R_TLT <- GSEA(
+  ranked_TLT,
+  TERM2GENE = msig_react[, c("gs_name", "gene_symbol")],
+  verbose = FALSE,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  method = "multilevel")
+
+dotplot(gsea_R_TLT, showCategory = 15, title = "Reactome gene sets:\nTLT vs. GFP" , split=".sign") + facet_grid(.~.sign)
+```
+
+There are again some chaperone terms in the top upregulated pathways.
+
+Export enrichment results as tsv.
+```{r}
+#write.table(as_tibble(gsea_R_TLT),here("Outputs", "SuppTable_TLTvsGFP_24hr_GSEA_Reactome.tsv"), sep = "\t")
+```
+
+Proteostasis-related terms:
+```{r}
+gsea_R_TLT_res <- as.data.frame(gsea_R_TLT) %>%
+  filter(grepl("UNFOLD|AUTOPHAG|PROTEOS|HEAT.?SHOCK|HSP|ER.?STRESS|UPR|CHAPER|AGGRES|MISFOLD", Description)) %>%
+  select( enrichmentScore, NES, pvalue, p.adjust, log2err)
+
+gsea_R_TLT_res
+```
+
+The chaperone pathways and heat shock are upregulated, while autophagy temrs are downregulated.
+
+Detailed GSEA plot:
+```{r}
+#| fig-width: 8
+gseaplot2(gsea_R_TLT,
+  geneSetID = rownames(gsea_R_TLT_res), 
+  title = "TLT vs. GFP", 
+  pvalue_table = T,
+  rel_heights = c(2, 0.5, 0.5))
+```
+
+Barplot for cleaner visualization.
+```{r}
+#| fig-height: 3
+#| fig-width: 9
+#| label: fig-TLTRprotbar
+#| fig-cap: Bar plot of NES scores of proteostasis-related Reactome gene sets in TLT vs. GFP.
+bar_plot <- tibble(term = str_to_title(gsub("_"," ", gsub("REACTOME", "", rownames(gsea_R_TLT_res)))),
+                  NES = gsea_R_TLT_res$NES, 
+                  padj = gsea_R_TLT_res$p.adjust)
+
+bar_plot$term <- factor(bar_plot$term, 
+                  levels = bar_plot$term[order(bar_plot$NES, decreasing = F)])
+
+p <- ggplot(bar_plot, aes(x = NES, y = term, fill = padj)) +
+  geom_bar(stat = "identity") +
+  scale_fill_gradient2(low = "#0000E6", 
+        high = "#C5C5C7", 
+        mid = "#7575EB", 
+        midpoint = 0.025) +
+  geom_vline(xintercept = 0, 
+      color = "black", 
+      linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "TLT vs. GFP",
+      subtitle = "Reactome: relevant enriched terms",
+      x = "Normalized Enrichment Score", 
+      y = "", 
+      fill = "Adjusted p-value:") +
+  theme(plot.title = element_text(size = 12, hjust = 0.5), 
+        plot.subtitle = element_text(size = 12, hjust = 0.5), 
+        axis.text = element_text(size = 10), 
+        legend.title = element_text(hjust = 0.5))
+
+p
+
+#ggsave(here("Figures","LTST_TLT_GSEA_reactome_select_barplot.pdf"), p, width = 9, height = 3, units = "in")
+```
+
+Which genes are in the leading edges?
+```{r}
+cnetplot(gsea_R_TLT, showCategory = rownames(gsea_R_TLT_res), foldChange = ranked_TLT) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+```
+
+#### Conclusion
+
+In both TLT and ER comparisons, some chaperone pathways and heat shock are upregulated, while autophagy terms are downregulated.
+
+### GO terms
+
+GSEA for GO terms, first for **ER vs GFP**.
+
+```{r}
+#| fig-height: 12
+#| warning: false
+gsea_GO_ER <- GSEA(
+  ranked_ER,
+  TERM2GENE = msig_GO[, c("gs_name", "gene_symbol")],
+  verbose = FALSE,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  method = "multilevel")
+
+dotplot(gsea_GO_ER, showCategory = 15, title = "GO gene sets:\nER vs. GFP" , split=".sign") + facet_grid(.~.sign)
+```
+
+Autophagy-related pathways are coming up in top downregulated terms.
+
+A nicer figure:
+```{r}
+#| fig-heigt: 9
+dotplot(gsea_GO_ER, showCategory = 10, title = "GO gene sets:\nER vs. GFP" , split=".sign") + facet_grid(.~.sign)
+```
+
+Or custom barplot figure:
+```{r}
+bar_plot <- tibble(GO_term = str_to_title(gsub("_"," ", gsub("GOBP|GOCC|GOMF", "", gsea_GO_ER@result$ID))), 
+                        NES = gsea_GO_ER@result$NES, 
+                        padj = gsea_GO_ER@result$p.adjust)
+
+bar_plot$GO_term <- factor(bar_plot$GO_term, levels = bar_plot$GO_term[order(abs(bar_plot$NES))])
+bar_plot <- bar_plot %>% 
+  mutate(direction = if_else(NES > 0, "Positive", "Negative")) %>%
+  group_by(direction) %>%
+  slice_min(padj, n = 10) %>%
+  slice_max(abs(NES), n = 10) %>%
+  ungroup()
+
+ggplot(bar_plot, aes(x = NES, y = GO_term, fill = padj)) +
+  geom_bar(stat = "identity") +
+  scale_fill_gradient2(low = "#740f96", high = "#ebe3ee", mid = "#8c4da1", midpoint = 0.00000002) +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Top 10 GO terms\nER vs. GFP",
+       x = "Normalized Enrichment Score", y = "", fill = "Adjusted p-value:") +
+  theme(title = element_text(size = 12))
+```
+
+Export enrichment results as tsv.
+```{r}
+#write.table(as_tibble(gsea_GO_ER),here("Outputs", "SuppTable_ERvsGFP_24hr_GSEA_GO.tsv"), sep = "\t")
+```
+
+Finding relevant terms:
+```{r}
+gsea_GO_ER_res <- as.data.frame(gsea_GO_ER) %>%
+  filter(grepl("UNFOLD|AUTOPHAG|PROTEOS|HEAT.?SHOCK|HSP|ER.?STRESS|_UPR|CHAPER|AGGRE|MISFOLD", Description)) %>%
+  dplyr::select(enrichmentScore, NES, pvalue, p.adjust, log2err)
+
+gsea_GO_ER_res
+```
+
+```{r}
+#| fig-heigt: 8
+dotplot(gsea_GO_ER, showCategory = rownames(gsea_GO_ER_res), title = "GO gene sets:\nER vs. GFP" , split=".sign") + facet_grid(.~.sign)
+```
+
+Or custom barplot figure with select genes:
+```{r}
+#| fig-height: 4.3
+#| fig-width: 6.4
+#| label: fig-ERGOprotbar
+#| fig-cap: Bar plot of NES scores of proteostasis-related GO gene sets in ER vs. GFP.
+bar_plot <- tibble(term = str_to_title(gsub("_"," ", gsub("GOBP|GOCC|GOMF", "", rownames(gsea_GO_ER_res)))), 
+                        NES = gsea_GO_ER_res$NES, 
+                        padj = gsea_GO_ER_res$p.adjust)
+
+bar_plot$term <- factor(bar_plot$term, levels = bar_plot$term[order(bar_plot$NES, decreasing = F)])
+
+p <- ggplot(bar_plot, aes(x = NES, y = term, fill = padj)) +
+  geom_bar(stat = "identity") +
+  scale_fill_gradient2(low = "#0000E6", 
+        high = "#C5C5C7", 
+        mid = "#7575EB", 
+        midpoint = 0.025) +
+  geom_vline(xintercept = 0, 
+      color = "black", 
+      linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "ER vs. GFP",
+      subtitle = "GO: relevant enriched terms",
+      x = "Normalized Enrichment Score", 
+      y = "", 
+      fill = "Adjusted p-value:") +
+  theme(plot.title = element_text(size = 12, hjust = 0.5), 
+        plot.subtitle = element_text(size = 12, hjust = 0.5), 
+        axis.text = element_text(size = 10), 
+        legend.title = element_text(hjust = 0.5))
+
+p
+
+#ggsave(here("Figures","LTST_ER_GSEA_GO_select_barplot.pdf"), p, width = 6.4, height = 4.3, units = "in")
+```
+
+Detailed GSEA plots - displaying results in two sections split by ordered p value.
+
+```{r}
+#| fig-width: 8
+gseaplot2(gsea_GO_ER,
+  geneSetID = rownames(gsea_GO_ER_res)[1:8], 
+  title = "ER vs. GFP", 
+  pvalue_table = T,
+  rel_heights = c(2, 0.5, 0.5))
+
+gseaplot2(gsea_GO_ER,
+  geneSetID = rownames(gsea_GO_ER_res)[9:17], 
+  title = "ER vs. GFP", 
+  pvalue_table = T,
+  rel_heights = c(2, 0.5, 0.5))
+```
+
+Chaperone activity seems to be higher in ER, whereas autophagy seems higher in the control.
+
+Which genes are in the leading edges?
+```{r}
+#| message: false
+cnetplot(gsea_GO_ER, showCategory = rownames(gsea_GO_ER_res) , foldChange = ranked_ER) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+
+cnetplot(gsea_GO_ER, showCategory = rownames(gsea_GO_ER_res[gsea_GO_ER_res$NES > 0,]) , foldChange = ranked_ER) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+
+  cnetplot(gsea_GO_ER, showCategory = rownames(gsea_GO_ER_res[gsea_GO_ER_res$NES < 0,]) , foldChange = ranked_ER) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+```
+
+Now GO terms for **TLT vs. GFP**.
+
+```{r}
+#| fig-height: 9
+#| warning: false
+gsea_GO_TLT <- GSEA(
+  ranked_TLT,
+  TERM2GENE = msig_GO[, c("gs_name", "gene_symbol")],
+  verbose = FALSE,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  method = "multilevel")
+
+dotplot(gsea_GO_TLT, showCategory = 15, title = "GO gene sets:\nTLT vs. GFP" , split=".sign") + facet_grid(.~.sign)
+```
+
+Autophagy-related pathways are coming up in top downregulated terms.
+
+A nicer figure:
+```{r}
+#| fig-heigt: 9
+dotplot(gsea_GO_TLT, showCategory = 10, title = "GO gene sets:\nTLT vs. GFP" , split=".sign") + facet_grid(.~.sign)
+```
+
+Or custom barplot figure:
+```{r}
+bar_plot <- tibble(GO_term = str_to_title(gsub("_"," ", gsub("GOBP|GOCC|GOMF", "", gsea_GO_TLT@result$ID))), 
+                        NES = gsea_GO_TLT@result$NES, 
+                        padj = gsea_GO_TLT@result$p.adjust)
+
+bar_plot$GO_term <- factor(bar_plot$GO_term, levels = bar_plot$GO_term[order(abs(bar_plot$NES))])
+bar_plot <- bar_plot %>% 
+  mutate(direction = if_else(NES > 0, "Positive", "Negative")) %>%
+  group_by(direction) %>%
+  slice_min(padj, n = 10) %>%
+  slice_max(abs(NES), n = 10) %>%
+  ungroup()
+
+ggplot(bar_plot, aes(x = NES, y = GO_term, fill = padj)) +
+  geom_bar(stat = "identity") +
+  scale_fill_gradient2(low = "#740f96", high = "#ebe3ee", mid = "#8c4da1", midpoint = 0.00000002) +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Top 10 GO terms\nTL vs. GFP",
+       x = "Normalized Enrichment Score", y = "", fill = "Adjusted p-value:") +
+  theme(title = element_text(size = 12))
+```
+The barplot does not show autophagy results in top 10, probably due to selection by NES instead of GeneRatio as in DotPlot.
+
+Export enrichment results as tsv.
+```{r}
+#write.table(as_tibble(gsea_GO_TLT),here("Outputs", "SuppTable_TLTvsGFP_24hr_GSEA_GO.tsv"), sep = "\t")
+```
+
+Finding relevant terms:
+```{r}
+gsea_GO_TLT_res <- as.data.frame(gsea_GO_TLT) %>%
+  filter(grepl("UNFOLD|AUTOPHAG|PROTEOS|HEAT.?SHOCK|HSP|ER.?STRESS|_UPR|CHAPER|AGGRE|MISFOLD", Description)) %>%
+  dplyr::select(enrichmentScore, NES, pvalue, p.adjust, log2err)
+
+gsea_GO_TLT_res
+```
+
+Unfolded response is higher in TLT, whereas autophagy is higher in control.
+
+Custom barplot figure with select genes:
+```{r}
+#| fig-heigt: 4.8
+#| fig-width: 6.4
+#| label: fig-TLTGOprotbar
+#| fig-cap: Bar plot of NES scores of proteostasis-related GO gene sets in TLT vs. GFP.
+bar_plot <- tibble(term = str_to_title(gsub("_"," ", gsub("GOBP|GOCC|GOMF", "", rownames(gsea_GO_TLT_res)))), 
+                        NES = gsea_GO_TLT_res$NES, 
+                        padj = gsea_GO_TLT_res$p.adjust)
+
+bar_plot$term <- factor(bar_plot$term, levels = bar_plot$term[order(bar_plot$NES, decreasing = F)])
+
+p <- ggplot(bar_plot, aes(x = NES, y = term, fill = padj)) +
+  geom_bar(stat = "identity") +
+  scale_fill_gradient2(low = "#0000E6", 
+        high = "#C5C5C7", 
+        mid = "#7575EB", 
+        midpoint = 0.025) +
+  geom_vline(xintercept = 0, 
+      color = "black", 
+      linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "TLT vs. GFP",
+      subtitle = "GO: relevant enriched terms",
+      x = "Normalized Enrichment Score", 
+      y = "", 
+      fill = "Adjusted p-value:") +
+  theme(plot.title = element_text(size = 12, hjust = 0.5), 
+        plot.subtitle = element_text(size = 12, hjust = 0.5), 
+        axis.text = element_text(size = 10), 
+        legend.title = element_text(hjust = 0.5))
+
+p
+
+#ggsave(here("Figures","LTST_TLT_GSEA_GO_select_barplot.pdf"), p, width = 6.4, height = 4.8, units = "in")
+```
+
+For the following detailed GSEA plots, splitting by p-value to show individual enrichments in detailed GSEA plots.
+```{r}
+#| fig-width: 8
+gseaplot2(gsea_GO_TLT,
+  geneSetID = rownames(gsea_GO_TLT_res)[1:8], 
+  title = "TLT vs. GFP", 
+  pvalue_table = T,
+  rel_heights = c(2, 0.5, 0.5))
+
+  gseaplot2(gsea_GO_TLT,
+  geneSetID = rownames(gsea_GO_TLT_res)[9:16], 
+  title = "TLT vs. GFP", 
+  pvalue_table = T,
+  rel_heights = c(2, 0.5, 0.5))
+
+  gseaplot2(gsea_GO_TLT,
+  geneSetID = rownames(gsea_GO_TLT_res)[17:24], 
+  title = "TLT vs. GFP", 
+  pvalue_table = T,
+  rel_heights = c(2, 0.5, 0.5))
+
+gseaplot2(gsea_GO_TLT,
+  geneSetID = rownames(gsea_GO_TLT_res)[25:29], 
+  title = "TLT vs. GFP", 
+  pvalue_table = T,
+  rel_heights = c(2, 0.5, 0.5))
+```
+
+Which genes are in the leading edges? 
+```{r}
+#| message: false
+cnetplot(gsea_GO_TLT, showCategory = rownames(gsea_GO_TLT_res) , foldChange = ranked_TLT) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+
+cnetplot(gsea_GO_TLT, showCategory = rownames(gsea_GO_TLT_res[gsea_GO_TLT_res$NES > 0,]) , foldChange = ranked_TLT) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+
+#strange behaviour with all 15 negative terms plotting, so showing all but regulation of autophagy
+cnetplot(gsea_GO_TLT, showCategory = rownames(gsea_GO_TLT_res[gsea_GO_TLT_res$NES < 0,])[c(1:8,10:5)] , foldChange = ranked_TLT) + 
+    scale_color_gradient2(name = "stat",
+      low = "blue",
+        mid = "white",
+          high = "red")
+```
+
+### Heatmap of top genes in GSEA GO hits
+
+First we evaluate the similarity of the enriched relevant terms to guide the decision on which to plot.
+```{r}
+#| warning: false
+#| message: false
+#| fig-height: 12
+#| fig-width: 12
+#| label: fig-ERemap
+#| fig-cap: Enrichment map of enriched proteostasis-related GO terms in ER vs. GFP. 
+# create a subset of the enrichment results with the relevant terms
+gsea_GO_ER_sub <- gsea_GO_ER
+gsea_GO_ER_sub@result <- gsea_GO_ER_sub@result[gsea_GO_ER_sub@result$ID %in% rownames(gsea_GO_ER_res), ]
+
+# calculate similarity between terms
+gsea_sim <- pairwise_termsim(gsea_GO_ER_sub)
+#plot
+emapplot(gsea_sim, size_edge = 2)
+```
+
+```{r}
+#| warning: false
+#| message: false
+#| fig-height: 12
+#| fig-width: 12
+#| label: fig-TLTemap
+#| fig-cap: Enrichment map of enriched proteostasis-related GO terms in TLT vs. GFP. 
+# create a subset of the enrichment results with the relevant terms
+gsea_GO_TLT_sub <- gsea_GO_TLT
+gsea_GO_TLT_sub@result <- gsea_GO_TLT_sub@result[gsea_GO_TLT_sub@result$ID %in% rownames(gsea_GO_TLT_res), ]
+
+# calculate similarity between terms
+gsea_sim <- pairwise_termsim(gsea_GO_TLT_sub)
+#plot
+emapplot(gsea_sim, size_edge = 2)
+```
+
+Selected pathways based on emapplot and cnet plots to represent both sides of processes, minimize gene overlap and cover as much of the map possible for both comparisons. These are:
+
+```{r}
+selected_terms <- c("GOCC_AUTOPHAGOSOME", "GOBP_MACROAUTOPHAGY" , "GOBP_REGULATION_OF_AUTOPHAGY", "GOMF_HEAT_SHOCK_PROTEIN_BINDING", "GOMF_ATP_DEPENDENT_PROTEIN_FOLDING_CHAPERONE", "GOBP_CELLULAR_RESPONSE_TO_UNFOLDED_PROTEIN")
+selected_terms
+```
+
+Extract top 10 genes from the leading edge of each of these terms in both comparisons. Remove repeating genes.
+```{r}
+# extract the leading edge genes - these are ordered by rank
+core_enrichment_ER <- gsea_GO_ER_sub@result[gsea_GO_ER_sub@result$ID %in% selected_terms, c("core_enrichment", "ID")]
+core_enrichment_TLT <- gsea_GO_TLT_sub@result[gsea_GO_TLT_sub@result$ID %in% selected_terms, c("core_enrichment", "ID")]
+
+#split into individual genes and extract top 10
+top10_genes_ER <- lapply(
+    core_enrichment_ER$core_enrichment,
+    function(x) strsplit(x, "/")[[1]][1:10]
+)
+# name list by ID
+names(top10_genes_ER) <- core_enrichment_ER$ID
+
+top10_genes_ER
+
+top10_genes_TLT <- lapply(
+    core_enrichment_TLT$core_enrichment,
+    function(x) strsplit(x, "/")[[1]][1:10]
+)
+
+names(top10_genes_TLT) <- core_enrichment_TLT$ID
+
+top10_genes_TLT
+
+plot_genes <- c(unlist(top10_genes_ER),unlist(top10_genes_TLT)) %>% unique
+```
+
+Z-scale transformed counts and plot heatmap with gene set annotation.
+```{r}
+#| message: false
+#| fig-width: 12
+# scale operates on columns
+mat_z <- scale(t(transformed_counts[plot_genes, ]))
+
+library(ComplexHeatmap)
+
+ha <- HeatmapAnnotation(
+    "Autophagosome" = plot_genes %in% (msig_GO %>% filter(gs_name == "GOCC_AUTOPHAGOSOME") %>% pull(gene_symbol)),
+    "Macroautophagy" = plot_genes %in% (msig_GO %>% filter(gs_name == "GOBP_MACROAUTOPHAGY") %>% pull(gene_symbol)),
+    "HSP binding"  = plot_genes %in% (msig_GO %>% filter(gs_name == "GOMF_HEAT_SHOCK_PROTEIN_BINDING") %>% pull(gene_symbol)),
+    "Regulation of autophagy" = plot_genes %in% (msig_GO %>% filter(gs_name == "GOBP_REGULATION_OF_AUTOPHAGY") %>% pull(gene_symbol)),
+    "Cellular response to UPR"  = plot_genes %in% (msig_GO %>% filter(gs_name == "GOBP_CELLULAR_RESPONSE_TO_UNFOLDED_PROTEIN") %>% pull(gene_symbol)),
+    "ATP-dep. chaperone"  = plot_genes %in% (msig_GO %>% filter(gs_name == "GOMF_ATP_DEPENDENT_PROTEIN_FOLDING_CHAPERONE") %>% pull(gene_symbol)),
+
+    col = list(
+        "Autophagosome" = c("TRUE" = "#a6cee3EE", "FALSE" = "white"),
+        "Macroautophagy" = c("TRUE" = "#1f78b4EE", "FALSE" = "white"),
+        "HSP binding" = c("TRUE" = "#b2df8a", "FALSE" = "white"),
+        "Regulation of autophagy" = c("TRUE" = "#33a02cEE", "FALSE" = "white"),
+        "Cellular response to UPR" = c("TRUE" = "#fb9a99EE", "FALSE" = "white"),
+        "ATP-dep. chaperone" = c("TRUE" = "#ff7f00EE", "FALSE" = "white")
+    ),
+    simple_anno_size = unit(3, "mm"),
+    annotation_name_gp = gpar(fontsize = 10),
+    show_legend = FALSE,
+    which = "column"
+)
+
+ht <- Heatmap(
+    mat_z,
+    name = "Expression (Z-score)",
+    top_annotation = ha,
+    show_row_dend = FALSE,
+    show_column_dend = FALSE,
+    column_names_gp = gpar(fontsize = 8),
+    row_names_gp = gpar(fontsize = 10),
+    width = unit(16.5, "cm"),
+    height = unit(5, "cm")
+)
+ht
+```
+
+```{r}
+#| eval: false
+pdf(here("Figures","LTST_Heatmap_leadingedge_genes.pdf"),
+    width = 15,
+    height = 6
+)
+
+draw(ht)
+
+dev.off()
+```
+
+Second plot version with top 8 genes selected for better plot fit into figure.
+
+```{r}
+#split into individual genes and extract top 10
+top8_genes_ER <- lapply(
+    core_enrichment_ER$core_enrichment,
+    function(x) strsplit(x, "/")[[1]][1:8]
+)
+# name list by ID
+names(top8_genes_ER) <- core_enrichment_ER$ID
+
+top8_genes_ER
+
+top8_genes_TLT <- lapply(
+    core_enrichment_TLT$core_enrichment,
+    function(x) strsplit(x, "/")[[1]][1:8]
+)
+
+names(top8_genes_TLT) <- core_enrichment_TLT$ID
+
+top8_genes_TLT
+
+plot_genes <- c(unlist(top8_genes_ER),unlist(top8_genes_TLT)) %>% unique
+```
+
+This results in about 10 genes less than the top-10 version.
+
+```{r}
+#| message: false
+#| fig-width: 12
+#| label: fig-TOPgeneHeatmap
+#| fig-cap: Heatmap of top 8 leading edge genes in 6 representative enriched GO terms.
+# scale operates on columns
+mat_z <- scale(t(transformed_counts[plot_genes, ]))
+
+library(ComplexHeatmap)
+
+ha <- HeatmapAnnotation(
+    "Autophagosome" = plot_genes %in% (msig_GO %>% filter(gs_name == "GOCC_AUTOPHAGOSOME") %>% pull(gene_symbol)),
+    "Macroautophagy" = plot_genes %in% (msig_GO %>% filter(gs_name == "GOBP_MACROAUTOPHAGY") %>% pull(gene_symbol)),
+    "HSP binding"  = plot_genes %in% (msig_GO %>% filter(gs_name == "GOMF_HEAT_SHOCK_PROTEIN_BINDING") %>% pull(gene_symbol)),
+    "Regulation of autophagy" = plot_genes %in% (msig_GO %>% filter(gs_name == "GOBP_REGULATION_OF_AUTOPHAGY") %>% pull(gene_symbol)),
+    "Cellular response to UPR"  = plot_genes %in% (msig_GO %>% filter(gs_name == "GOBP_CELLULAR_RESPONSE_TO_UNFOLDED_PROTEIN") %>% pull(gene_symbol)),
+    "ATP-dep. chaperone"  = plot_genes %in% (msig_GO %>% filter(gs_name == "GOMF_ATP_DEPENDENT_PROTEIN_FOLDING_CHAPERONE") %>% pull(gene_symbol)),
+
+    col = list(
+        "Autophagosome" = c("TRUE" = "#a6cee3EE", "FALSE" = "white"),
+        "Macroautophagy" = c("TRUE" = "#1f78b4EE", "FALSE" = "white"),
+        "HSP binding" = c("TRUE" = "#b2df8a", "FALSE" = "white"),
+        "Regulation of autophagy" = c("TRUE" = "#33a02cEE", "FALSE" = "white"),
+        "Cellular response to UPR" = c("TRUE" = "#fb9a99EE", "FALSE" = "white"),
+        "ATP-dep. chaperone" = c("TRUE" = "#ff7f00EE", "FALSE" = "white")
+    ),
+    simple_anno_size = unit(3, "mm"),
+    annotation_name_gp = gpar(fontsize = 10),
+    show_legend = FALSE,
+    which = "column"
+)
+
+ht <- Heatmap(
+    mat_z,
+    name = "Expression (Z-score)",
+    top_annotation = ha,
+    show_row_dend = FALSE,
+    show_column_dend = FALSE,
+    column_names_gp = gpar(fontsize = 8),
+    row_names_gp = gpar(fontsize = 10),
+    width = unit(15, "cm"),
+    height = unit(5, "cm")
+)
+ht
+```
+
+```{r}
+#| eval: false
+pdf(here("Figures","LTST_Heatmap_leadingedge_genes_v2.pdf"),
+    width = 15,
+    height = 6
+)
+
+draw(ht)
+
+dev.off()
+```
+
+#### Conclusion
+
+Go terms show clear supression of autophagy gene sets in both ER vs. GFP and TLT vs. GFP. Simultaneously, various pathways involving chaperone genes are upregulated.
+
+### GSEA with single term
+
+We found a reference for an extended list of genes (36) in the **GOCC Aggresome term**. We will manually run it as a single set. According to the [database](https://maayanlab.cloud/Harmonizome/gene_set/aggresome/GO+Cellular+Component+Annotations+2023), this is a GOCC Annotation from 2023. It provides and external link to the [source](http://amigo.geneontology.org/amigo/term/GO:0016235), which however contains fewer genes.
+
+Make the gene set:
+```{r}
+genes <- c("BAG3","CABIN1","CARD14","DVL2","EDEM1","EEF2","EPS15","FGR","HDAC6","HOXC9","HOXD3","HSPA1A","HSPA1B","HSPB7","KLF8","KLHL14","PARK2","POLD1","PRDM16","PRKCQ","PSEN1","RANGAP1","RNF32","SFMBT2","SLC2A14","SLC2A3","SQSTM1","STRADB","TDP2","TRIM37","TRIM66","UBD","UBQLN1","URB2","XRN2","ZBTB14")
+
+sig_aggresome <- tibble(gs_name = "GOCC_AGGRESOME", gene = genes)
+```
+
+First **ER vs. GFP** comparison.
+
+Run GSEA and investigate detailed plot.
+```{r}
+#| fig-height: 9
+#| warning: false
+library(fgsea)
+
+fgsea(pathways = list(Aggresome = sig_aggresome$gene),
+stats = ranked_ER)
+
+gsea_aggresome <- GSEA(
+ranked_ER,
+TERM2GENE = sig_aggresome,
+verbose = FALSE,
+pvalueCutoff = 1,
+pAdjustMethod = "BH"
+)
+```
+
+```{r}
+#| fig-width: 5
+#| fig-height: 3.5
+#| label: fig-ERagg
+#| fig-cap: GSEA plot of GOCC Aggresome gene set in ER vs. GFP.
+p <- gseaplot2(gsea_aggresome,
+  geneSetID = 1, 
+  title = "ER vs. GFP", 
+  pvalue_table = T,
+  rel_heights = c(1.2, 0.2, 0.5))
+p
+
+#ggsave(here("Figures","LTST_ER_GSEA_singleTerm_Aggresome.pdf"), p, width = 3.7, height = 2.7, units = "in")
+```
+
+```{r}
+#| warning: false
+cnetplot(gsea_aggresome, foldChange = ranked_ER) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+```
+
+Now for **TLT vs. GFP**.
+
+Run GSEA and investigate detailed plot.
+```{r}
+#| fig-height: 9
+#| warning: false
+library(fgsea)
+
+fgsea(pathways = list(Aggresome = sig_aggresome$gene),
+stats = ranked_TLT)
+
+gsea_aggresome <- GSEA(
+ranked_TLT,
+TERM2GENE = sig_aggresome,
+verbose = FALSE,
+pvalueCutoff = 1,
+pAdjustMethod = "BH"
+)
+```
+
+```{r}
+#| fig-width: 5
+#| fig-height: 3.5
+#| label: fig-TLTagg
+#| fig-cap: GSEA plot of GOCC Aggresome gene set in TLT vs. GFP.
+p <- gseaplot2(gsea_aggresome,
+  geneSetID = 1, 
+  title = "TLT vs. GFP", 
+  pvalue_table = T,
+  rel_heights = c(1.2, 0.2, 0.5))
+p
+
+#ggsave(here("Figures","LTST_TLT_GSEA_singleTerm_Aggresome.pdf"), p, width = 3.7, height = 2.7, units = "in")
+ 
+```
+
+```{r}
+cnetplot(gsea_aggresome, foldChange = ranked_TLT) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+```
+
+#### Conclusion
+
+The enrichment is not statistically significant, but there do seem to be more terms in the upregulated genes.
+
+# 48hr timepoint
+
+Next I am only selecting the 48hr timepoint, despite it being incomplete. I will only use this analysis for GSEA, which does not have the same statistical requirements.
+
+```{r}
+count_48 <- counts %>%
+  dplyr::select(matches("^(ER|TLT|GFP)_(48)_"))
+count_48 %>% colnames
+```
+
+
+## DEseq for normalization and DEG
+
+```{r}
+#| message: false
+metadata <- data.frame(condition = factor(gsub("_48_(1|2|3)", "", colnames(count_48))), 
+                      replicate = factor(gsub("[A-Za]+_48_", "", colnames(count_48)))) 
+rownames(metadata) <- colnames(count_48)
+
+dds <- DESeqDataSetFromMatrix(countData = as.matrix(count_48),
+                              colData = metadata,
+                              design = ~ condition)
+```
+```{r}
+# Remove genes have less than 2 samples with 10 counts or more
+keep <- rowSums(counts(dds) >= 10) >= 2
+dds <- dds[keep,]
+
+#Deseq function automatically estimates size factors and dispersios
+dds <- DESeq(dds)
+```
+
+## DEGs for ranked list
+
+Look at top ten genes in the two main comparisons of interest.
+```{r}
+res_ER_48 <- results(dds, alpha = 0.05, contrast = c("condition","ER", "GFP"))
+summary(res_ER_48)
+
+#top10 genes
+res_ER_48[order(res_ER_48$pvalue),] %>% head(10)
+```
+
+TLT results:
+```{r}
+res_TLT_48 <- results(dds, alpha = 0.05, contrast = c("condition","TLT", "GFP"))
+summary(res_TLT_48)
+
+res_TLT_48[order(res_TLT_48$pvalue),] %>% head(10)
+```
+
+## GSEA
+
+Next will perform GSEA on similar genesets in the two condition comparisons. Genes will be ranked by test statistic to incorporate information from both Log2FC and significance, despite not having full sample sets.
+
+### Hallmark GSEA
+
+First derive ranked list from **ER vs. GFP** and check top and bottom genes.
+```{r}
+deg_ER_48 <- res_ER_48 %>% 
+  as_tibble(rownames = "gene")
+
+ranked_ER_48 <- deg_ER_48 %>% 
+  # extract statistic
+  pull(stat) %>% 
+  # add names 
+  setNames(deg_ER_48$gene) %>% 
+  # sort in decreasing order
+  sort(decreasing = T)
+
+#show top and bottom genes to verify behavior
+head(ranked_ER_48)
+tail(ranked_ER_48)
+```
+
+```{r}
+#| fig-height: 10
+#| warning: false
+gsea_H_ER_48 <- GSEA(
+  ranked_ER_48,
+  TERM2GENE = msig_h[, c("gs_name", "gene_symbol")],
+  verbose = FALSE,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  method = "multilevel")
+
+dotplot(gsea_H_ER_48, showCategory = 20, title = "Hallmark gene sets:\nER vs. GFP (48hr)" , split=".sign") + facet_grid(.~.sign)
+```
+
+The unfolded protein response is higher in ER samples as in the 24hr timepoint.
+
+```{r}
+#| fig-width: 8
+gseaplot2(gsea_H_ER_48,
+  geneSetID = "HALLMARK_UNFOLDED_PROTEIN_RESPONSE", 
+  title = "ER vs. GFP (48hr)", 
+  pvalue_table = T,
+  rel_heights = c(2, 0.5, 0.5))
+```
+
+Which genes are in the leading edge?
+```{r}
+#| message: false
+cnetplot(gsea_H_ER_48, showCategory = "HALLMARK_UNFOLDED_PROTEIN_RESPONSE", foldChange = ranked_ER_48) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+```
+
+Now for **TLT vs. GFP** comparison at 48hrs. First prepare ranked gene list and check top and bottom genes.
+```{r}
+deg_TLT_48 <- res_TLT_48 %>% 
+  as_tibble(rownames = "gene")
+
+ranked_TLT_48 <- deg_TLT_48 %>% 
+  # extract statistic
+  pull(stat) %>% 
+  # add names 
+  setNames(deg_TLT_48$gene) %>% 
+  # sort in decreasing order
+  sort(decreasing = T)
+
+#show top and bottom genes to verify behavior
+head(ranked_TLT_48)
+tail(ranked_TLT_48)
+```
+
+```{r}
+#| fig-height: 8.5
+#| warning: false
+gsea_H_TLT_48 <- GSEA(
+  ranked_TLT_48,
+  TERM2GENE = msig_h[, c("gs_name", "gene_symbol")],
+  verbose = FALSE,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  method = "multilevel")
+
+dotplot(gsea_H_TLT_48, showCategory = 20, title = "Hallmark gene sets:\nTLT vs. GFP (48hr)" , split=".sign") + facet_grid(.~.sign)
+```
+
+The there is no difference in UPR in contrast to the ER vs. GFP comparison or the TLT vs. GFP comparison at 24hrs.
+
+#### Conclusion
+
+Hallmark unfolded response picks up genes from both upregulated and downregulated areas, but is significantly positively enriched in the ER vs. GFP comparison (same as 24hrs). It is not significant for TLT vs. GFP, which previously (24hrs) showed downregulation.
+
+### Reactome gene sets
+
+First for **ER vs. GFP**.
+
+```{r}
+#| fig-height: 12
+#| warning: false
+gsea_R_ER_48 <- GSEA(
+  ranked_ER_48,
+  TERM2GENE = msig_react[, c("gs_name", "gene_symbol")],
+  verbose = FALSE,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  method = "multilevel")
+
+dotplot(gsea_R_ER_48, showCategory = 15, title = "Reactome gene sets:\nER vs. GFP (48hr)" , split=".sign") + facet_grid(.~.sign)
+```
+
+There don't seem to be relevant terms in the top 15.
+
+Relevant terms:
+```{r}
+gsea_R_ER_res_48 <- as.data.frame(gsea_R_ER_48) %>%
+  filter(grepl("UNFOLD|AUTOPHAG|PROTEOS|HEAT.?SHOCK|HSP|ER.?STRESS|UPR|CHAPER|AGGRES|MISFOLD", Description)) %>%
+  select( enrichmentScore, NES, pvalue, p.adjust, log2err)
+
+gsea_R_ER_res_48
+```
+
+The HSF-1 mediated heat shock term comes up again as upregulated, autophagy terms are downregulated. This is consistent with results at 24hrs. The difference here is that UPR is downregulated, unlike the Hallmarks at 24 and 48 hrs suggested.
+
+Detailed GSEA plot.
+```{r}
+#| fig-width: 8
+gseaplot2(gsea_R_ER_48,
+  geneSetID = rownames(gsea_R_ER_res_48), 
+  title = "ER vs. GFP (48 hrs)", 
+  pvalue_table = T,
+  rel_heights = c(2, 0.5, 0.5))
+```
+
+Which genes are in the leading edges?
+```{r}
+cnetplot(gsea_R_ER_48, showCategory = rownames(gsea_R_ER_res_48), foldChange = ranked_ER_48) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+```
+
+Now Reactome for **TLT vs. GFP** comparison.
+
+```{r}
+#| fig-height: 12
+#| warning: false
+gsea_R_TLT_48 <- GSEA(
+  ranked_TLT_48,
+  TERM2GENE = msig_react[, c("gs_name", "gene_symbol")],
+  verbose = FALSE,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  method = "multilevel")
+
+dotplot(gsea_R_TLT_48, showCategory = 15, title = "Reactome gene sets:\nTLT vs. GFP (48hr)" , split=".sign") + facet_grid(.~.sign)
+```
+
+There are no ubviously relevant terms in the top genes.
+
+Relevant terms:
+```{r}
+gsea_R_TLT_res_48 <- as.data.frame(gsea_R_TLT_48) %>%
+  filter(grepl("UNFOLD|AUTOPHAG|PROTEOS|HEAT.?SHOCK|HSP|ER.?STRESS|UPR|CHAPER|AGGRES|MISFOLD", Description)) %>%
+  select( enrichmentScore, NES, pvalue, p.adjust, log2err)
+
+gsea_R_TLT_res_48
+```
+
+A heat shock pathway is upregulated, while an autophagy term is downregulated. This is consistent with the 24 hr timepoint. Additionally, UPR snd some chaperones are downregulated, which is different to 24hrs.
+
+Detaled GSEA plot:
+```{r}
+#| fig-width: 8
+gseaplot2(gsea_R_TLT_48,
+  geneSetID = rownames(gsea_R_TLT_res_48), 
+  title = "TLT vs. GFP (48hr)", 
+  pvalue_table = T,
+  rel_heights = c(2, 0.5, 0.5))
+```
+
+Which genes are in the leading edges?
+```{r}
+cnetplot(gsea_R_TLT_48, showCategory = rownames(gsea_R_TLT_res_48), foldChange = ranked_TLT_48) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+```
+
+#### Conclusion
+
+In both TLT and ER comparisons, the one heat shock pathways is consistently upregulated, while autophagy terms are downregulated. This is consistent with 24 hrs. The consistency with chaperone pathways and UPR are less clear.
+
+### GO terms
+
+First for **ER vs. GFP**.
+
+```{r}
+#| fig-height: 12
+#| warning: false
+gsea_GO_ER_48 <- GSEA(
+  ranked_ER_48,
+  TERM2GENE = msig_GO[, c("gs_name", "gene_symbol")],
+  verbose = FALSE,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  method = "multilevel")
+
+dotplot(gsea_GO_ER_48, showCategory = 15, title = "GO gene sets:\nER vs. GFP (48 hrs)" , split=".sign") + facet_grid(.~.sign)
+```
+
+No related pathways are coming up in top terms.
+
+Finding relevant terms:
+```{r}
+gsea_GO_ER_res_48 <- as.data.frame(gsea_GO_ER_48) %>%
+  filter(grepl("UNFOLD|AUTOPHAG|PROTEOS|HEAT.?SHOCK|HSP|ER.?STRESS|_UPR|CHAPER|AGGRES|MISFOLD", Description)) %>%
+  dplyr::select( enrichmentScore, NES, pvalue, p.adjust, log2err)
+
+gsea_GO_ER_res_48
+```
+
+```{r}
+#| fig-heigt: 8
+dotplot(gsea_GO_ER_48, showCategory = rownames(gsea_GO_ER_res_48), title = "GO gene sets:\nER vs. GFP (48hr)" , split=".sign") + facet_grid(.~.sign)
+```
+
+Custom barplot figure with select genes:
+```{r}
+#| fig-height: 4.3
+#| fig-width: 6.4
+bar_plot <- tibble(term = str_to_title(gsub("_"," ", gsub("GOBP|GOCC|GOMF", "", rownames(gsea_GO_ER_res_48)))), 
+                        NES = gsea_GO_ER_res_48$NES, 
+                        padj = gsea_GO_ER_res_48$p.adjust)
+
+bar_plot$term <- factor(bar_plot$term, levels = bar_plot$term[order(bar_plot$NES, decreasing = F)])
+
+p <- ggplot(bar_plot, aes(x = NES, y = term, fill = padj)) +
+  geom_bar(stat = "identity") +
+  scale_fill_gradient2(low = "#0000E6", 
+        high = "#C5C5C7", 
+        mid = "#7575EB", 
+        midpoint = 0.025) +
+  geom_vline(xintercept = 0, 
+      color = "black", 
+      linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "ER vs. GFP (48 hr)",
+      subtitle = "GO: relevant enriched terms",
+      x = "Normalized Enrichment Score", 
+      y = "", 
+      fill = "Adjusted p-value:") +
+  theme(plot.title = element_text(size = 12, hjust = 0.5), 
+        plot.subtitle = element_text(size = 12, hjust = 0.5), 
+        axis.text = element_text(size = 10), 
+        legend.title = element_text(hjust = 0.5))
+
+p
+
+#ggsave(here("Figures","LTST_ER_48hr_GSEA_GO_select_barplot.pdf"), p, width = 6.4, height = 4.3, units = "in")
+
+```
+
+Detailed GSEA plots - displaying results in three sections split by ordered p value.
+```{r}
+#| fig-width: 8
+gseaplot2(gsea_GO_ER_48,
+  geneSetID = rownames(gsea_GO_ER_res_48)[1:8], 
+  title = "ER vs. GFP (48hr)", 
+  pvalue_table = T,
+  rel_heights = c(2, 0.5, 0.5))
+
+gseaplot2(gsea_GO_ER_48,
+  geneSetID = rownames(gsea_GO_ER_res_48)[9:16], 
+  title = "ER vs. GFP (48hr)", 
+  pvalue_table = T,
+  rel_heights = c(2, 0.5, 0.5))
+
+  gseaplot2(gsea_GO_ER_48,
+  geneSetID = rownames(gsea_GO_ER_res_48)[17:21], 
+  title = "ER vs. GFP (48hr)", 
+  pvalue_table = T,
+  rel_heights = c(2, 0.5, 0.5))
+```
+
+Autophagy seems higher in the control, which is consistent to results at 24 hr. Upregulated chaperone terms appear, but not as much as in 24 hrs.
+
+Which genes are in the leading edges?
+```{r}
+#| message: false
+cnetplot(gsea_GO_ER_48, showCategory = rownames(gsea_GO_ER_res_48) , foldChange = ranked_ER_48) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+
+cnetplot(gsea_GO_ER_48, showCategory = rownames(gsea_GO_ER_res_48[gsea_GO_ER_res_48$NES > 0,]) , foldChange = ranked_ER_48) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+
+  cnetplot(gsea_GO_ER_48, showCategory = rownames(gsea_GO_ER_res_48[gsea_GO_ER_res_48$NES < 0,]) , foldChange = ranked_ER_48) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+```
+
+Now GO terms for **TLT vs. GFP**.
+
+```{r}
+#| fig-height: 9
+#| warning: false
+gsea_GO_TLT_48 <- GSEA(
+  ranked_TLT_48,
+  TERM2GENE = msig_GO[, c("gs_name", "gene_symbol")],
+  verbose = FALSE,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  method = "multilevel")
+
+dotplot(gsea_GO_TLT_48, showCategory = 15, title = "GO gene sets:\nTLT vs. GFP (48hr)" , split=".sign") + facet_grid(.~.sign)
+```
+
+No pathways are coming up in top downregulated terms.
+
+Finding relevant terms:
+```{r}
+gsea_GO_TLT_res_48 <- as.data.frame(gsea_GO_TLT_48) %>%
+  filter(grepl("UNFOLD|AUTOPHAG|PROTEOS|HEAT.?SHOCK|HSP|ER.?STRESS|_UPR|CHAPER|AGGRES|MISFOLD", Description)) %>%
+  dplyr::select(enrichmentScore, NES, pvalue, p.adjust, log2err)
+
+gsea_GO_TLT_res_48
+```
+
+Autophagy is higher in control and some chaperone activity in TLT, similar to 24hrs.
+
+Custom barplot figure with select genes:
+```{r}
+#| fig-width: 7.8
+#| fig-height: 4.5
+bar_plot <- tibble(term = str_to_title(gsub("_"," ", gsub("GOBP|GOCC|GOMF", "", rownames(gsea_GO_TLT_res_48)))), 
+                        NES = gsea_GO_TLT_res_48$NES, 
+                        padj = gsea_GO_TLT_res_48$p.adjust)
+
+bar_plot$term <- factor(bar_plot$term, levels = bar_plot$term[order(bar_plot$NES, decreasing = F)])
+
+p <- ggplot(bar_plot, aes(x = NES, y = term, fill = padj)) +
+  geom_bar(stat = "identity") +
+  scale_fill_gradient2(low = "#0000E6", 
+        high = "#C5C5C7", 
+        mid = "#7575EB", 
+        midpoint = 0.025) +
+  geom_vline(xintercept = 0, 
+      color = "black", 
+      linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "TLT vs. GFP (48hr)",
+      subtitle = "GO: relevant enriched terms",
+      x = "Normalized Enrichment Score", 
+      y = "", 
+      fill = "Adjusted p-value:") +
+  theme(plot.title = element_text(size = 12, hjust = 0.5), 
+        plot.subtitle = element_text(size = 12, hjust = 0.5), 
+        axis.text = element_text(size = 10), 
+        legend.title = element_text(hjust = 0.5))
+
+p
+
+#ggsave(here("Figures","LTST_TLT_48hr_GSEA_GO_select_barplot.pdf"), p, width = 7.8, height = 4.5, units = "in")
+```
+
+For next plots, splitting by p-value to show individual enrichments in detailed GSEA plots.
+```{r}
+#| fig-width: 8
+gseaplot2(gsea_GO_TLT_48,
+  geneSetID = rownames(gsea_GO_TLT_res_48)[1:8], 
+  title = "TLT vs. GFP (48hr)", 
+  pvalue_table = T,
+  rel_heights = c(2, 0.5, 0.5))
+
+  gseaplot2(gsea_GO_TLT_48,
+  geneSetID = rownames(gsea_GO_TLT_res_48)[9:16], 
+  title = "TLT vs. GFP (48hr)", 
+  pvalue_table = T,
+  rel_heights = c(2, 0.5, 0.5))
+
+  gseaplot2(gsea_GO_TLT_48,
+  geneSetID = rownames(gsea_GO_TLT_res_48)[17:23], 
+  title = "TLT vs. GFP (48hr)", 
+  pvalue_table = T,
+  rel_heights = c(2, 0.5, 0.5))
+```
+
+Which genes are in the leading edges? 
+```{r}
+#| message: false
+cnetplot(gsea_GO_TLT_48, showCategory = rownames(gsea_GO_TLT_res_48) , foldChange = ranked_TLT_48) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+
+cnetplot(gsea_GO_TLT_48, showCategory = rownames(gsea_GO_TLT_res_48[gsea_GO_TLT_res_48$NES > 0,]) , foldChange = ranked_TLT_48) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+
+#strange behaviour with all 15 negative terms plotting, so showing all but regulation of autophagy
+cnetplot(gsea_GO_TLT_48, showCategory = rownames(gsea_GO_TLT_res_48[gsea_GO_TLT_res_48$NES < 0,])[c(1:8,10:5)] , foldChange = ranked_TLT_48) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+```
+
+#### Conclusion
+
+Autophagy patterns are consistent with 24 hr timepoint (downregulated). Chaperone pathways as well, but to a lesser degree.
+
+### GSEA with single term
+
+Same as for 24hr timepoint
+Run GSEA and investigate detailed plot.
+```{r}
+#| fig-height: 9
+#| warning: false
+
+fgsea(pathways = list(Aggresome = sig_aggresome$gene),
+stats = ranked_TLT_48)
+
+gsea_aggresome <- GSEA(
+ranked_TLT_48,
+TERM2GENE = sig_aggresome,
+verbose = FALSE,
+pvalueCutoff = 1,
+pAdjustMethod = "BH"
+)
+
+gseaplot2(gsea_aggresome, geneSetID = 1,  title = "TLT vs. GFP (Only one GS tested, 48hr)", 
+  pvalue_table = T) 
+
+cnetplot(gsea_aggresome, foldChange = ranked_TLT_48) + 
+  scale_color_gradient2(name = "stat",
+  low = "blue",
+  mid = "white",
+  high = "red")
+```
+
+#### Conclusion
+
+The enrichment is not statistically significant, but there do seem to be more terms in the upregulated genes, as was the case for 24 hrs.
+
+# Session info
+
+```{r}
+sessionInfo()
+```

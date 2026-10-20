@@ -12,10 +12,12 @@ Data/*
 Outputs/
 Figures/
 
-# ignore some spesicif scripts
-Scripts/Test*
+# ignore some specific scripts
+Scripts/*
+!Scripts/Aggresome*.qmd
 
 #temp
 Scripts/*_files
-Aggresome_rel*
+Aggresome_rel*.html
+Aggresome*_files/
 
