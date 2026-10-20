@@ -22,8 +22,7 @@ Aggresome_MCC/
 ├── Scripts/                    # Scripts for analysis and report generation
 ├── renv/                       # R environment infrastructure
 ├── renv.lock                   # Reproducible package versions
-├── Aggresome_related_analysis_trLT_ER_overexpression_GSE130639.html
-│                               # Main analysis report
+├── index.html                  # Main analysis report
 └── Aggresome_related_analysis_trLT_ER_overexpression_GSE130639_files/
                                 # Supporting files required for HTML rendering
 ```
