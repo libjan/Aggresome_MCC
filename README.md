@@ -30,7 +30,7 @@ Aggresome_MCC/
 
 ## Main report
 
-The rendered analysis report including all figures in the manuscript is available here: [Analysis report](index.html )
+The rendered analysis report including all figures in the manuscript is available here: [Analysis report](https://libjan.github.io/Aggresome_MCC/s)
 
 ## Reproducibility
 
