@@ -1,0 +1,21 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+.Rprofile
+
+# Do not track Data except for README
+Data/*
+!Data/README.md
+
+# Do not track outputs from code or figures
+Outputs/
+Figures/
+
+# ignore some spesicif scripts
+Scripts/Test*
+
+#temp
+Scripts/*_files
+Aggresome_rel*
+
