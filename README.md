@@ -1,7 +1,2 @@
-# GSE130639_LT_ST_overexpression
-
-README.md
-Scripts/paper_analysis.qmd
-report.html
-data/
-renv.lock
+# Aggresome_MCC
+MCPyV promotes aggresome formation in MCC
