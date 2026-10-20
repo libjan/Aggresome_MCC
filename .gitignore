@@ -16,8 +16,6 @@ Figures/
 Scripts/*
 !Scripts/Aggresome*.qmd
 
-#temp
-Scripts/*_files
-Aggresome_rel*.html
-Aggresome*_files/
+
+
 
